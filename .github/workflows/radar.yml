@@ -1,0 +1,54 @@
+name: Radar Vintage Vinted
+
+# Searches Vinted every hour and publishes the matches to the `radar-data`
+# branch (feed.json). The Claude scheduled task reads that feed, keeps the
+# best pieces and adds them to the Radar Vintage Vinted artifact.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: radar
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Pillow (thumbnails)
+        run: pip install --quiet pillow
+
+      - name: Restore previous feed
+        run: |
+          mkdir -p data
+          if git fetch --quiet --depth 1 origin radar-data; then
+            git show FETCH_HEAD:feed.json > data/feed.json || rm -f data/feed.json
+            git show FETCH_HEAD:seen.json > data/seen.json || rm -f data/seen.json
+          fi
+
+      - name: Search Vinted
+        run: python scanner/scanner.py feed --data data
+
+      - name: Publish feed to radar-data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd data
+          printf 'Flux du Radar Vintage Vinted, réécrit à chaque scan par le workflow radar.yml.\n' > README.md
+          git init --quiet -b radar-data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit --quiet -m "Radar feed $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push --quiet --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" radar-data

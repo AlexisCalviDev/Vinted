@@ -12,6 +12,7 @@
   "max_price": 300,
   "keep_days": 10,
   "max_rows": 300,
+  "feed_hours": 12,
   "queries": [
     {"text": "barbour"},
     {"text": "ralph lauren vintage"},

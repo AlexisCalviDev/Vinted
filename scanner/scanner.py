@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """Vinted vintage scanner.
 
-Two steps, run by the hourly scheduled task:
+Hourly pipeline (the Claude cloud environment cannot reach vinted.fr, so
+GitHub Actions does the searching):
+
+  GitHub Actions:  python3 scanner.py feed --data DATA_DIR
+      Queries Vinted and refreshes DATA_DIR/feed.json + seen.json, pushed to
+      the `radar-data` branch.
+
+  Claude task:     python3 -I scanner.py from-feed --feed feed.json --state STATE_DIR --out OUT_DIR
+      Same outputs as `scan` below, built from the feed instead of Vinted.
+
+Direct mode (when this machine can reach vinted.fr):
 
   python3 -I scanner.py scan --state STATE_DIR --out OUT_DIR
       Reads the artifact's current rows (saved by ArtifactData with out_dir),
@@ -244,25 +254,18 @@ def make_thumb(api, url):
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
-def cmd_scan(args):
-    cfg = load_json(args.config or os.path.join(HERE, "config.json"))
-    out = args.out
-    os.makedirs(os.path.join(out, "docs"), exist_ok=True)
-    existing = read_state_docs(args.state, "items") if args.state else {}
+def collect(cfg, skip_ids):
+    """Query Vinted. Returns (status, docs) with docs best-first."""
     status = {"last_run": now_iso(), "ok": False, "scanned": 0, "matched": 0,
               "queries": len(cfg["queries"]), "error": None}
-
     api = Vinted()
     seen, candidates = set(), []
     errors = 0
     try:
         api.warm_up()
-    except Exception as e:  # network policy, DataDome, ...
+    except Exception as e:  # network policy, anti-bot, ...
         status["error"] = "Accès à vinted.fr impossible : %s" % e
-        dump_json(os.path.join(out, "status.json"), status)
-        dump_json(os.path.join(out, "candidates.json"), [])
-        print(json.dumps(status, ensure_ascii=False))
-        return 2
+        return status, []
 
     for q in cfg["queries"]:
         params = {"search_text": q["text"], "catalog_ids": q.get("catalog", cfg["catalog_men"])}
@@ -277,7 +280,7 @@ def cmd_scan(args):
         for it in items:
             iid = str(it.get("id"))
             status["scanned"] += 1
-            if iid in seen or iid in existing:
+            if iid in seen or iid in skip_ids:
                 continue
             seen.add(iid)
             bucket = size_bucket(it.get("size_title"), cfg)
@@ -290,17 +293,16 @@ def cmd_scan(args):
 
     candidates.sort(key=lambda c: -c[0])
     candidates = candidates[: cfg["max_candidates"]]
-    compact = []
+    docs = []
     for sc, reasons, bucket, it in candidates:
         iid = str(it["id"])
-        price = price_value(it)
         doc = {
             "vinted_id": iid,
             "title": it.get("title"),
             "brand": it.get("brand_title"),
             "size": it.get("size_title"),
             "condition": it.get("status"),
-            "price": price,
+            "price": price_value(it),
             "total_price": price_value({"price": it.get("total_item_price")}),
             "currency": (it.get("price") or {}).get("currency_code", "EUR") if isinstance(it.get("price"), dict) else "EUR",
             "url": it.get("url") or "%s/items/%s" % (BASE, iid),
@@ -318,11 +320,28 @@ def cmd_scan(args):
             doc["thumb"] = make_thumb(api, thumb_url(it))
         except Exception as e:
             print("thumb failed", iid, e, file=sys.stderr)
-        dump_json(os.path.join(out, "docs", iid + ".json"), doc)
-        compact.append({k: doc[k] for k in ("vinted_id", "title", "brand", "size", "condition",
-                                             "price", "category", "score", "tags")})
+        docs.append(doc)
 
-    # Rows older than keep_days are pruned so the store stays small.
+    n = len(cfg["queries"])
+    status.update(ok=errors < n, matched=len(docs),
+                  error=None if errors < n else "Toutes les recherches Vinted ont échoué")
+    if errors and status["ok"]:
+        status["error"] = "%d recherche(s) sur %d en échec" % (errors, n)
+    return status, docs
+
+
+def write_out(out, cfg, status, docs, existing):
+    """Write candidates/docs/prune/status for the review + finalize steps."""
+    os.makedirs(os.path.join(out, "docs"), exist_ok=True)
+    compact = []
+    for doc in docs:
+        if doc["vinted_id"] in existing:
+            continue
+        dump_json(os.path.join(out, "docs", doc["vinted_id"] + ".json"), doc)
+        compact.append({k: doc.get(k) for k in ("vinted_id", "title", "brand", "size", "condition",
+                                                 "price", "category", "score", "tags")})
+    # Rows older than keep_days, or past max_rows, are pruned so the store
+    # stays light (saved pieces are kept per viewer, with their own copy).
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=cfg["keep_days"])
     prune = []
     rows = sorted(existing.items(), key=lambda kv: kv[1]["body"].get("found_at") or "", reverse=True)
@@ -332,20 +351,78 @@ def cmd_scan(args):
             too_old = bool(found) and dt.datetime.fromisoformat(found) < cutoff
         except ValueError:
             too_old = False
-        # Keep the store light: drop old rows and anything past max_rows
-        # (saved pieces are kept per viewer, with their own copy).
         if too_old or rank >= cfg["max_rows"]:
             prune.append(doc_id)
-
-    status.update(ok=errors < len(cfg["queries"]), matched=len(compact),
-                  error=None if errors < len(cfg["queries"]) else "Toutes les recherches ont échoué")
-    if errors and status["ok"]:
-        status["error"] = "%d recherche(s) sur %d en échec" % (errors, len(cfg["queries"]))
+    status["matched"] = len(compact)
     dump_json(os.path.join(out, "candidates.json"), compact)
     dump_json(os.path.join(out, "prune.json"), prune)
     dump_json(os.path.join(out, "status.json"), status)
     print(json.dumps({**status, "candidates": len(compact), "prune": len(prune)}, ensure_ascii=False))
     return 0 if status["ok"] else 2
+
+
+def load_cfg(args):
+    return load_json(args.config or os.path.join(HERE, "config.json"))
+
+
+def cmd_scan(args):
+    """Direct mode: this machine queries Vinted itself."""
+    cfg = load_cfg(args)
+    existing = read_state_docs(args.state, "items") if args.state else {}
+    status, docs = collect(cfg, set(existing))
+    return write_out(args.out, cfg, status, docs, existing)
+
+
+def cmd_feed(args):
+    """GitHub Actions mode: refresh DATA/feed.json (rolling window of recent
+    candidates) and DATA/seen.json (ids already offered, for dedupe)."""
+    cfg = load_cfg(args)
+    data = args.data
+    os.makedirs(data, exist_ok=True)
+    seen = load_json(os.path.join(data, "seen.json"), {}) or {}
+    feed = load_json(os.path.join(data, "feed.json"), {}) or {}
+    status, docs = collect(cfg, set(seen))
+    now = dt.datetime.now(dt.timezone.utc)
+    window = now - dt.timedelta(hours=cfg.get("feed_hours", 12))
+    keep = []
+    for d in feed.get("items", []):
+        try:
+            if dt.datetime.fromisoformat(d.get("found_at", "")) >= window:
+                keep.append(d)
+        except ValueError:
+            pass
+    new_ids = {d["vinted_id"] for d in docs}
+    items = docs + [d for d in keep if d["vinted_id"] not in new_ids]
+    for d in docs:
+        seen[d["vinted_id"]] = d["found_at"]
+    horizon = (now - dt.timedelta(days=cfg["keep_days"] + 4)).isoformat()
+    seen = {k: v for k, v in seen.items() if v >= horizon}
+    dump_json(os.path.join(data, "feed.json"), {"generated_at": now_iso(), "status": status, "items": items})
+    dump_json(os.path.join(data, "seen.json"), seen)
+    print(json.dumps({**status, "new": len(docs), "feed_items": len(items)}, ensure_ascii=False))
+    return 0  # always publish the feed, even when Vinted refused us
+
+
+def cmd_from_feed(args):
+    """Claude mode: turn the feed published by GitHub Actions into rows."""
+    cfg = load_cfg(args)
+    existing = read_state_docs(args.state, "items") if args.state else {}
+    feed = load_json(args.feed, None)
+    if not isinstance(feed, dict):
+        status = {"last_run": now_iso(), "ok": False, "scanned": 0, "matched": 0,
+                  "error": "Flux GitHub illisible ou absent : le scan GitHub Actions n'a peut-être pas encore tourné."}
+        return write_out(args.out, cfg, status, [], existing)
+    status = dict(feed.get("status") or {})
+    status["feed_generated_at"] = feed.get("generated_at")
+    try:
+        age = dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(feed.get("generated_at"))
+        if age > dt.timedelta(hours=3):
+            status["ok"] = False
+            status["error"] = ("Le scan GitHub Actions n'a pas tourné depuis %d h : vérifie l'onglet Actions du dépôt."
+                               % (age.total_seconds() // 3600))
+    except (TypeError, ValueError):
+        pass
+    return write_out(args.out, cfg, status, feed.get("items", []), existing)
 
 
 def cmd_finalize(args):
@@ -390,12 +467,21 @@ def main():
     s.add_argument("--state")
     s.add_argument("--out", required=True)
     s.add_argument("--config")
+    fd = sub.add_parser("feed")
+    fd.add_argument("--data", required=True)
+    fd.add_argument("--config")
+    ff = sub.add_parser("from-feed")
+    ff.add_argument("--feed", required=True)
+    ff.add_argument("--state")
+    ff.add_argument("--out", required=True)
+    ff.add_argument("--config")
     f = sub.add_parser("finalize")
     f.add_argument("--out", required=True)
     f.add_argument("--review", required=True)
     f.add_argument("--versions")
     a = ap.parse_args()
-    sys.exit(cmd_scan(a) if a.cmd == "scan" else cmd_finalize(a))
+    run = {"scan": cmd_scan, "feed": cmd_feed, "from-feed": cmd_from_feed, "finalize": cmd_finalize}[a.cmd]
+    sys.exit(run(a))
 
 
 if __name__ == "__main__":
