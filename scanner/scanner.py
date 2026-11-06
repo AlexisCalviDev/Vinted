@@ -115,6 +115,68 @@ class Vinted:
         return self._get(url, accept="image/avif,image/webp,image/*,*/*", timeout=20)
 
 
+LABEL_RE = re.compile(
+    r"^(?P<title>.*?), Marque: (?P<brand>.*?), État: (?P<cond>.*?)"
+    r"(?:, Taille: (?P<size>.*?))?, (?P<price>[\d\s.,]+) €(?:, (?P<total>[\d\s.,]+) €)?\s*$")
+
+
+def _num(s):
+    if not s:
+        return None
+    s = s.replace("\u202f", "").replace(" ", "")
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+    s = s.replace(",", "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_card(card):
+    """Turn a catalog card (from vinted_fetch.js) into the API-like item
+    shape the scorer expects."""
+    m = LABEL_RE.match(card.get("label") or card.get("alt") or "")
+    if not m:
+        return None
+    href = (card.get("href") or "").split("?")[0]
+    return {
+        "id": card["id"],
+        "title": m.group("title").strip(),
+        "brand_title": m.group("brand").strip(),
+        "status": m.group("cond").strip(),
+        "size_title": (m.group("size") or "").strip(),
+        "price": {"amount": _num(m.group("price")), "currency_code": "EUR"},
+        "total_item_price": {"amount": _num(m.group("total"))},
+        "url": href or "%s/items/%s" % (BASE, card["id"]),
+        "photo": {"url": card.get("img") or None},
+    }
+
+
+def fetch_catalogs(cfg):
+    """Run vinted_fetch.js once for every query (one browser session)."""
+    import subprocess
+    import tempfile
+    qs = [{"text": q["text"], "catalog": q.get("catalog", cfg["catalog_men"])} for q in cfg["queries"]]
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(qs, f)
+        qpath = f.name
+    try:
+        proc = subprocess.run(["node", os.path.join(HERE, "vinted_fetch.js"), qpath],
+                              capture_output=True, text=True, timeout=900)
+    finally:
+        os.unlink(qpath)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "navigateur en échec").strip().splitlines()[-1][:300])
+    raw = json.loads(proc.stdout)
+    out = {"_errors": raw.pop("_errors", {})}
+    for k, cards in raw.items():
+        out[k] = [it for it in (parse_card(c) for c in cards) if it]
+    for k, v in out["_errors"].items():
+        print("query failed:", k, v, file=sys.stderr)
+    return out
+
+
 # --------------------------------------------------------------------------
 # Filtering and scoring
 # --------------------------------------------------------------------------
@@ -145,9 +207,9 @@ def classify(item, bucket):
     if bucket == "chaussures":
         return "chaussures"
     t = norm(item.get("title"))
-    if re.search(r"\b(jean|pantalon|chino|cargo|short|trouser|denim 5\d\d|501|505|517)\b", t):
+    if re.search(r"\b(jeans?|pantalon|pantalones|pants|chino|cargo|short|trousers?|salopette|overall|dungarees|501|505|517|615)\b", t):
         return "bas"
-    if re.search(r"\b(veste|jacket|blouson|manteau|parka|coat|trench|bomber|caban|gilet|waxed|duffle|harrington|anorak|doudoune|cuir)\b", t):
+    if re.search(r"(veste|jacket|jacke|giacca|giubbotto|chaqueta|blouson|manteau|parka|coat|trench|bomber|caban|gilet|weste|waxed|wachs|duffle|harrington|anorak|doudoune|beaufort|bedale|border|blazer|sakko|sherpa)", t):
         return "vestes"
     return "hauts"
 
@@ -260,24 +322,15 @@ def collect(cfg, skip_ids):
               "queries": len(cfg["queries"]), "error": None}
     api = Vinted()
     seen, candidates = set(), []
-    errors = 0
     try:
-        api.warm_up()
-    except Exception as e:  # network policy, anti-bot, ...
+        results = fetch_catalogs(cfg)
+    except Exception as e:  # network policy, anti-bot, browser missing, ...
         status["error"] = "Accès à vinted.fr impossible : %s" % e
         return status, []
+    errors = len(results.pop("_errors", {}) or {})
 
     for q in cfg["queries"]:
-        params = {"search_text": q["text"], "catalog_ids": q.get("catalog", cfg["catalog_men"])}
-        try:
-            items = api.search(params)
-        except Exception as e:
-            errors += 1
-            print("query failed:", q["text"], e, file=sys.stderr)
-            continue
-        finally:
-            time.sleep(random.uniform(1.2, 2.4))
-        for it in items:
+        for it in results.get(q["text"], []):
             iid = str(it.get("id"))
             status["scanned"] += 1
             if iid in seen or iid in skip_ids:
